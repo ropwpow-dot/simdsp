@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Диспетчер оборотной станции метро</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1a1a2e;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Courier New', monospace;
+            color: #c0c0c0;
+            overflow: hidden;
+        }
+        h1 {
+            font-size: 18px;
+            margin: 10px 0 5px;
+            color: #8fbc8f;
+            letter-spacing: 2px;
+        }
+        canvas {
+            border: 2px solid #3a3a4a;
+            cursor: pointer;
+            display: block;
+        }
+        #info {
+            display: flex;
+            gap: 30px;
+            margin-top: 8px;
+            font-size: 13px;
+        }
+        #info span { color: #8fbc8f; }
+        #log {
+            margin-top: 8px;
+            font-size: 11px;
+            color: #777;
+            max-width: 1200px;
+            text-align: center;
+            height: 40px;
+            overflow: hidden;
+        }
+        #controls {
+            margin-top: 6px;
+            font-size: 12px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <h1>ДИСПЕТЧЕР ОБОРОТНОЙ СТАНЦИИ</h1>
+    <canvas id="canvas"></canvas>
+    <div id="info">
+        <div>Стрелка: <span id="switchState">ПРЯМО</span></div>
+        <div>Поезда обработано: <span id="trainCount">0</span></div>
+        <div>След. поезд: <span id="nextTrain">--</span></div>
+        <div>Время: <span id="clock">00:00</span></div>
+    </div>
+    <div id="controls">Клик по светофору — сменить сигнал | Клик по стрелке (◇) — переключить | Красный — стоп, Синий — можно ехать</div>
+    <div id="log"></div>
+    <script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+const W = 1200, H = 550;
+canvas.width = W;
+canvas.height = H;
+
+const TRACK_1_Y = 200;
+const TRACK_2_Y = 370;
+const STATION_LEFT = 140;
+const STATION_RIGHT = 480;
+const SIGNAL_X_STATION = 540;
+const CROSSOVER_LEFT = 610;
+const CROSSOVER_RIGHT = 720;
+const SIDING_END = 1120;
+const SIGNAL_X_SIDING = 1040;
+const TRAIN_LENGTH = 110;
+const TRAIN_WIDTH = 22;
+const WAGON_COUNT = 5;
+const WAGON_LENGTH = TRAIN_LENGTH / WAGON_COUNT;
+const STATION_STOP_X = 320;
+const BUFFER_STOP_X = SIDING_END - 15;
+
+const BG_COLOR = '#c8e6c0';
+const TRACK_COLOR = '#3a3a3a';
+const TRACK_WIDTH = 4;
+const PLATFORM_COLOR = '#a0a0a0';
+const PLATFORM_BORDER = '#555';
+const SIGNAL_RADIUS = 10;
+const SWITCH_SIZE = 14;
+
+let elapsedTime = 0;
+let trainCount = 0;
+let nextTrainTimer = 5;
+let logMessages = [];
+
+// crossover: 'parallel' or 'crossed'
+// parallel: Track1 → Siding1, Track2 → Siding2
+// crossed: Track1 → Siding2, Track2 → Siding1
+let crossoverState = 'parallel';
+
+const signals = {
+    s1: { x: SIGNAL_X_STATION, y: TRACK_1_Y, state: 'red', direction: 'right', label: 'Н1' },
+    s2: { x: SIGNAL_X_STATION, y: TRACK_2_Y, state: 'red', direction: 'right', label: 'Н2' },
+    s3: { x: SIGNAL_X_SIDING, y: TRACK_1_Y, state: 'red', direction: 'left', label: 'О1' },
+    s4: { x: SIGNAL_X_SIDING, y: TRACK_2_Y, state: 'red', direction: 'left', label: 'О2' },
+};
+
+const TRAIN_STATES = {
+    ARRIVING: 'arriving',
+    AT_STATION_1: 'at_station_1',
+    WAITING_SIGNAL_1: 'waiting_signal_1',
+    IN_CROSSOVER_TO_SIDING: 'in_crossover_to_siding',
+    ENTERING_SIDING: 'entering_siding',
+    IN_SIDING: 'in_siding',
+    WAITING_SIGNAL_SIDING: 'waiting_signal_siding',
+    EXITING_SIDING: 'exiting_siding',
+    IN_CROSSOVER_TO_TRACK: 'in_crossover_to_track',
+    APPROACHING_STATION_2: 'approaching_station_2',
+    AT_STATION_2: 'at_station_2',
+    DEPARTING: 'departing',
+    GONE: 'gone'
+};
+
+let trains = [];
+let trainIdCounter = 0;
+
+function createTrain() {
+    trainIdCounter++;
+    return {
+        id: trainIdCounter,
+        x: -TRAIN_LENGTH - 20,
+        y: TRACK_1_Y,
+        targetX: null,
+        targetY: null,
+        speed: 2.5,
+        state: TRAIN_STATES.ARRIVING,
+        siding: null, // 1 or 2
+        stationTimer: 0,
+        sidingTimer: 0,
+        waitTime: 3 + Math.random() * 2,
+        sidingWaitTime: 4 + Math.random() * 3,
+        departureTrack: TRACK_2_Y,
+    };
+}
+
+function addLog(msg) {
+    logMessages.unshift(msg);
+    if (logMessages.length > 3) logMessages.pop();
+    document.getElementById('log').textContent = logMessages.join(' | ');
+}
+
+function getSignalForEntry(trackY) {
+    return trackY === TRACK_1_Y ? signals.s1 : signals.s2;
+}
+
+function getSignalForSiding(sidingNum) {
+    return sidingNum === 1 ? signals.s3 : signals.s4;
+}
+
+function getSidingY(sidingNum) {
+    return sidingNum === 1 ? TRACK_1_Y : TRACK_2_Y;
+}
+
+function getTargetSiding(trackY) {
+    if (crossoverState === 'parallel') {
+        return trackY === TRACK_1_Y ? 1 : 2;
+    } else {
+        return trackY === TRACK_1_Y ? 2 : 1;
+    }
+}
+
+function getExitTrackY(sidingNum) {
+    if (crossoverState === 'parallel') {
+        return sidingNum === 1 ? TRACK_1_Y : TRACK_2_Y;
+    } else {
+        return sidingNum === 1 ? TRACK_2_Y : TRACK_1_Y;
+    }
+}
+
+function isCrossoverOccupied() {
+    return trains.some(t =>
+        t.state === TRAIN_STATES.IN_CROSSOVER_TO_SIDING ||
+        t.state === TRAIN_STATES.IN_CROSSOVER_TO_TRACK
+    );
+}
+
+function isSidingOccupied(sidingNum) {
+    const sidingY = getSidingY(sidingNum);
+    return trains.some(t => {
+        if (t.siding !== sidingNum) return false;
+        return (
+            t.state === TRAIN_STATES.ENTERING_SIDING ||
+            t.state === TRAIN_STATES.IN_SIDING ||
+            t.state === TRAIN_STATES.WAITING_SIGNAL_SIDING ||
+            t.state === TRAIN_STATES.EXITING_SIDING
+        );
+    });
+}
+
+function lerp(a, b, t) {
+    return a + (b - a) * t;
+}
+
+function updateTrain(train, dt) {
+    switch (train.state) {
+        case TRAIN_STATES.ARRIVING: {
+            const stationOccupied = trains.some(t =>
+                t.id !== train.id && t.y === TRACK_1_Y &&
+                (t.state === TRAIN_STATES.AT_STATION_1 ||
+                 t.state === TRAIN_STATES.WAITING_SIGNAL_1) &&
+                t.x < STATION_STOP_X + TRAIN_LENGTH
+            );
+            if (stationOccupied && train.x >= STATION_LEFT - TRAIN_LENGTH - 30) {
+                break;
+            }
+            train.x += train.speed;
+            if (train.x >= STATION_STOP_X - TRAIN_LENGTH / 2) {
+                train.x = STATION_STOP_X - TRAIN_LENGTH / 2;
+                train.state = TRAIN_STATES.AT_STATION_1;
+                train.stationTimer = 0;
+                addLog(`Поезд #${train.id} прибыл на станцию (путь 1)`);
+            }
+            break;
+        }
+        case TRAIN_STATES.AT_STATION_1: {
+            train.stationTimer += dt;
+            if (train.stationTimer >= train.waitTime) {
+                train.state = TRAIN_STATES.WAITING_SIGNAL_1;
+            }
+            break;
+        }
+        case TRAIN_STATES.WAITING_SIGNAL_1: {
+            const sig = getSignalForEntry(TRACK_1_Y);
+            if (sig.state === 'blue') {
+                const targetSiding = getTargetSiding(TRACK_1_Y);
+                if (!isSidingOccupied(targetSiding) && !isCrossoverOccupied()) {
+                    train.siding = targetSiding;
+                    train.state = TRAIN_STATES.IN_CROSSOVER_TO_SIDING;
+                    train.targetY = getSidingY(targetSiding);
+                    sig.state = 'red';
+                    addLog(`Поезд #${train.id} → оборотный тупик ${targetSiding}`);
+                }
+            }
+            if (train.state === TRAIN_STATES.WAITING_SIGNAL_1) {
+                train.x = STATION_STOP_X - TRAIN_LENGTH / 2;
+            }
+            break;
+        }
+        case TRAIN_STATES.IN_CROSSOVER_TO_SIDING: {
+            const targetX = CROSSOVER_RIGHT + 10;
+            const progress = (train.x - (STATION_STOP_X - TRAIN_LENGTH / 2)) /
+                             (targetX - (STATION_STOP_X - TRAIN_LENGTH / 2));
+            train.x += train.speed;
+            if (train.x >= CROSSOVER_LEFT && train.x <= CROSSOVER_RIGHT + TRAIN_LENGTH) {
+                const crossProgress = Math.min(1, Math.max(0,
+                    (train.x - CROSSOVER_LEFT + TRAIN_LENGTH / 2) /
+                    (CROSSOVER_RIGHT - CROSSOVER_LEFT + TRAIN_LENGTH)));
+                train.y = lerp(TRACK_1_Y, train.targetY, crossProgress);
+            }
+            if (train.x >= targetX) {
+                train.x = targetX;
+                train.y = train.targetY;
+                train.state = TRAIN_STATES.ENTERING_SIDING;
+            }
+            break;
+        }
+        case TRAIN_STATES.ENTERING_SIDING: {
+            train.x += train.speed;
+            if (train.x >= BUFFER_STOP_X - TRAIN_LENGTH) {
+                train.x = BUFFER_STOP_X - TRAIN_LENGTH;
+                train.state = TRAIN_STATES.IN_SIDING;
+                train.sidingTimer = 0;
+                addLog(`Поезд #${train.id} в тупике ${train.siding}, разворот...`);
+            }
+            break;
+        }
+        case TRAIN_STATES.IN_SIDING: {
+            train.sidingTimer += dt;
+            if (train.sidingTimer >= train.sidingWaitTime) {
+                train.state = TRAIN_STATES.WAITING_SIGNAL_SIDING;
+            }
+            break;
+        }
+        case TRAIN_STATES.WAITING_SIGNAL_SIDING: {
+            const sig = getSignalForSiding(train.siding);
+            if (sig.state === 'blue' && !isCrossoverOccupied()) {
+                train.state = TRAIN_STATES.EXITING_SIDING;
+                train.departureTrack = getExitTrackY(train.siding);
+                sig.state = 'red';
+                addLog(`Поезд #${train.id} выезжает из тупика ${train.siding}`);
+            }
+            break;
+        }
+        case TRAIN_STATES.EXITING_SIDING: {
+            train.x -= train.speed;
+            if (train.x <= CROSSOVER_RIGHT + 10) {
+                train.x = CROSSOVER_RIGHT + 10;
+                train.state = TRAIN_STATES.IN_CROSSOVER_TO_TRACK;
+                train.targetY = train.departureTrack;
+            }
+            break;
+        }
+        case TRAIN_STATES.IN_CROSSOVER_TO_TRACK: {
+            const startX = CROSSOVER_RIGHT + 10;
+            const endX = CROSSOVER_LEFT - TRAIN_LENGTH - 10;
+            train.x -= train.speed;
+            if (train.x >= endX && train.x <= startX) {
+                const crossProgress = Math.min(1, Math.max(0,
+                    1 - (train.x - endX) / (startX - endX)));
+                train.y = lerp(getSidingY(train.siding), train.targetY, crossProgress);
+            }
+            if (train.x <= endX) {
+                train.x = endX;
+                train.y = train.targetY;
+                train.state = TRAIN_STATES.APPROACHING_STATION_2;
+            }
+            break;
+        }
+        case TRAIN_STATES.APPROACHING_STATION_2: {
+            const station2Occupied = trains.some(t =>
+                t.id !== train.id &&
+                (t.state === TRAIN_STATES.AT_STATION_2 ||
+                 t.state === TRAIN_STATES.DEPARTING) &&
+                Math.abs(t.y - train.departureTrack) < 30
+            );
+            if (station2Occupied) break;
+            train.x -= train.speed;
+            if (train.x <= STATION_STOP_X - TRAIN_LENGTH / 2) {
+                train.x = STATION_STOP_X - TRAIN_LENGTH / 2;
+                train.state = TRAIN_STATES.AT_STATION_2;
+                train.stationTimer = 0;
+                addLog(`Поезд #${train.id} на станции (путь 2), высадка`);
+            }
+            break;
+        }
+        case TRAIN_STATES.AT_STATION_2: {
+            train.stationTimer += dt;
+            if (train.stationTimer >= train.waitTime) {
+                train.state = TRAIN_STATES.DEPARTING;
+                trainCount++;
+                document.getElementById('trainCount').textContent = trainCount;
+                addLog(`Поезд #${train.id} отправлен с пути 2`);
+            }
+            break;
+        }
+        case TRAIN_STATES.DEPARTING: {
+            train.x -= train.speed * 1.2;
+            if (train.x < -TRAIN_LENGTH - 50) {
+                train.state = TRAIN_STATES.GONE;
+            }
+            break;
+        }
+    }
+}
+
+function drawTrack(x1, y1, x2, y2) {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.strokeStyle = TRACK_COLOR;
+    ctx.lineWidth = TRACK_WIDTH;
+    ctx.stroke();
+
+    // rail ties
+    const dist = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
+    const tieSpacing = 18;
+    const dx = (x2 - x1) / dist;
+    const dy = (y2 - y1) / dist;
+    const nx = -dy;
+    const ny = dx;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#555';
+    for (let d = tieSpacing; d < dist - tieSpacing / 2; d += tieSpacing) {
+        const px = x1 + dx * d;
+        const py = y1 + dy * d;
+        ctx.beginPath();
+        ctx.moveTo(px - nx * 8, py - ny * 8);
+        ctx.lineTo(px + nx * 8, py + ny * 8);
+        ctx.stroke();
+    }
+}
+
+function drawRails(x1, y1, x2, y2) {
+    const dist = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
+    const dx = (x2 - x1) / dist;
+    const dy = (y2 - y1) / dist;
+    const nx = -dy;
+    const ny = dx;
+    const gauge = 5;
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = TRACK_COLOR;
+    ctx.beginPath();
+    ctx.moveTo(x1 + nx * gauge, y1 + ny * gauge);
+    ctx.lineTo(x2 + nx * gauge, y2 + ny * gauge);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x1 - nx * gauge, y1 - ny * gauge);
+    ctx.lineTo(x2 - nx * gauge, y2 - ny * gauge);
+    ctx.stroke();
+}
+
+function drawAllTracks() {
+    // Track 1 - left approach
+    drawTrack(0, TRACK_1_Y, STATION_LEFT, TRACK_1_Y);
+    drawRails(0, TRACK_1_Y, STATION_LEFT, TRACK_1_Y);
+
+    // Track 1 - through station
+    drawTrack(STATION_LEFT, TRACK_1_Y, STATION_RIGHT, TRACK_1_Y);
+    drawRails(STATION_LEFT, TRACK_1_Y, STATION_RIGHT, TRACK_1_Y);
+
+    // Track 1 - station to crossover
+    drawTrack(STATION_RIGHT, TRACK_1_Y, CROSSOVER_LEFT, TRACK_1_Y);
+    drawRails(STATION_RIGHT, TRACK_1_Y, CROSSOVER_LEFT, TRACK_1_Y);
+
+    // Track 2 - left approach
+    drawTrack(0, TRACK_2_Y, STATION_LEFT, TRACK_2_Y);
+    drawRails(0, TRACK_2_Y, STATION_LEFT, TRACK_2_Y);
+
+    // Track 2 - through station
+    drawTrack(STATION_LEFT, TRACK_2_Y, STATION_RIGHT, TRACK_2_Y);
+    drawRails(STATION_LEFT, TRACK_2_Y, STATION_RIGHT, TRACK_2_Y);
+
+    // Track 2 - station to crossover
+    drawTrack(STATION_RIGHT, TRACK_2_Y, CROSSOVER_LEFT, TRACK_2_Y);
+    drawRails(STATION_RIGHT, TRACK_2_Y, CROSSOVER_LEFT, TRACK_2_Y);
+
+    // Crossover zone
+    drawCrossover();
+
+    // Siding 1
+    drawTrack(CROSSOVER_RIGHT, TRACK_1_Y, SIDING_END, TRACK_1_Y);
+    drawRails(CROSSOVER_RIGHT, TRACK_1_Y, SIDING_END, TRACK_1_Y);
+
+    // Siding 2
+    drawTrack(CROSSOVER_RIGHT, TRACK_2_Y, SIDING_END, TRACK_2_Y);
+    drawRails(CROSSOVER_RIGHT, TRACK_2_Y, SIDING_END, TRACK_2_Y);
+
+    // Buffer stops
+    drawBufferStop(SIDING_END, TRACK_1_Y);
+    drawBufferStop(SIDING_END, TRACK_2_Y);
+}
+
+function drawCrossover() {
+    const activeColor = '#3a3a3a';
+    const inactiveColor = '#888';
+
+    if (crossoverState === 'parallel') {
+        // Active: straight through
+        ctx.lineWidth = TRACK_WIDTH;
+        ctx.strokeStyle = activeColor;
+        ctx.beginPath();
+        ctx.moveTo(CROSSOVER_LEFT, TRACK_1_Y);
+        ctx.lineTo(CROSSOVER_RIGHT, TRACK_1_Y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(CROSSOVER_LEFT, TRACK_2_Y);
+        ctx.lineTo(CROSSOVER_RIGHT, TRACK_2_Y);
+        ctx.stroke();
+        drawRails(CROSSOVER_LEFT, TRACK_1_Y, CROSSOVER_RIGHT, TRACK_1_Y);
+        drawRails(CROSSOVER_LEFT, TRACK_2_Y, CROSSOVER_RIGHT, TRACK_2_Y);
+
+        // Inactive: diagonals (dimmed)
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = inactiveColor;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(CROSSOVER_LEFT, TRACK_1_Y);
+        ctx.lineTo(CROSSOVER_RIGHT, TRACK_2_Y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(CROSSOVER_LEFT, TRACK_2_Y);
+        ctx.lineTo(CROSSOVER_RIGHT, TRACK_1_Y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+    } else {
+        // Active: diagonal cross
+        ctx.lineWidth = TRACK_WIDTH;
+        ctx.strokeStyle = activeColor;
+        ctx.beginPath();
+        ctx.moveTo(CROSSOVER_LEFT, TRACK_1_Y);
+        ctx.lineTo(CROSSOVER_RIGHT, TRACK_2_Y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(CROSSOVER_LEFT, TRACK_2_Y);
+        ctx.lineTo(CROSSOVER_RIGHT, TRACK_1_Y);
+        ctx.stroke();
+        drawRails(CROSSOVER_LEFT, TRACK_1_Y, CROSSOVER_RIGHT, TRACK_2_Y);
+        drawRails(CROSSOVER_LEFT, TRACK_2_Y, CROSSOVER_RIGHT, TRACK_1_Y);
+
+        // Inactive: straight (dimmed)
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = inactiveColor;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(CROSSOVER_LEFT, TRACK_1_Y);
+        ctx.lineTo(CROSSOVER_RIGHT, TRACK_1_Y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(CROSSOVER_LEFT, TRACK_2_Y);
+        ctx.lineTo(CROSSOVER_RIGHT, TRACK_2_Y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+    }
+
+    // Switch diamond indicator
+    const cx = (CROSSOVER_LEFT + CROSSOVER_RIGHT) / 2;
+    const cy = (TRACK_1_Y + TRACK_2_Y) / 2;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(Math.PI / 4);
+    ctx.strokeStyle = '#444';
+    ctx.lineWidth = 2;
+    ctx.fillStyle = crossoverState === 'parallel' ? 'transparent' : 'transparent';
+    ctx.beginPath();
+    ctx.rect(-SWITCH_SIZE, -SWITCH_SIZE, SWITCH_SIZE * 2, SWITCH_SIZE * 2);
+    ctx.stroke();
+    ctx.restore();
+
+    // Switch label
+    ctx.fillStyle = '#444';
+    ctx.font = '11px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText(crossoverState === 'parallel' ? 'ПРЯМО' : 'КРЕСТ', cx, cy + SWITCH_SIZE + 18);
+    ctx.fillText('◇ стрелка', cx, cy + SWITCH_SIZE + 32);
+}
+
+function drawBufferStop(x, y) {
+    ctx.strokeStyle = '#c0392b';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 14);
+    ctx.lineTo(x, y + 14);
+    ctx.stroke();
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 10);
+    ctx.lineTo(x - 8, y - 14);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, y + 10);
+    ctx.lineTo(x - 8, y + 14);
+    ctx.stroke();
+}
+
+function drawPlatform() {
+    const pLeft = STATION_LEFT - 10;
+    const pRight = STATION_RIGHT + 10;
+    const pTop = TRACK_1_Y + 14;
+    const pBottom = TRACK_2_Y - 14;
+
+    // Platform body (outline only)
+    ctx.strokeStyle = PLATFORM_BORDER;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.rect(pLeft, pTop, pRight - pLeft, pBottom - pTop);
+    ctx.stroke();
+
+    // Platform hatching
+    ctx.strokeStyle = '#999';
+    ctx.lineWidth = 0.5;
+    for (let x = pLeft + 10; x < pRight; x += 15) {
+        ctx.beginPath();
+        ctx.moveTo(x, pTop);
+        ctx.lineTo(x - 10, pBottom);
+        ctx.stroke();
+    }
+
+    // Platform edges (yellow safety line)
+    ctx.strokeStyle = '#c9a830';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 3]);
+    ctx.beginPath();
+    ctx.moveTo(pLeft, pTop);
+    ctx.lineTo(pRight, pTop);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(pLeft, pBottom);
+    ctx.lineTo(pRight, pBottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Station label
+    ctx.fillStyle = '#555';
+    ctx.font = 'bold 13px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('ПЛАТФОРМА', (pLeft + pRight) / 2, (pTop + pBottom) / 2 + 4);
+
+    // Side platforms
+    const sideTop = TRACK_1_Y - 35;
+    const sideBottom = TRACK_2_Y + 35;
+
+    ctx.strokeStyle = PLATFORM_BORDER;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.rect(pLeft, sideTop, pRight - pLeft, TRACK_1_Y - 14 - sideTop);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.rect(pLeft, TRACK_2_Y + 14, pRight - pLeft, sideBottom - TRACK_2_Y - 14);
+    ctx.stroke();
+
+    // Track labels
+    ctx.fillStyle = '#666';
+    ctx.font = '11px Courier New';
+    ctx.textAlign = 'left';
+    ctx.fillText('Путь 1 →', 10, TRACK_1_Y - 15);
+    ctx.fillText('← Путь 2', 10, TRACK_2_Y + 25);
+    ctx.fillText('Тупик 1', SIDING_END - 80, TRACK_1_Y - 15);
+    ctx.fillText('Тупик 2', SIDING_END - 80, TRACK_2_Y + 25);
+}
+
+function drawSignal(key) {
+    const sig = signals[key];
+    const x = sig.x;
+    const y = sig.y;
+    const r = SIGNAL_RADIUS;
+
+    // Mast
+    const mastDir = sig.direction === 'right' ? -1 : 1;
+    ctx.strokeStyle = '#444';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(x, y + (sig.direction === 'right' ? -20 : 20));
+    ctx.lineTo(x, y + (sig.direction === 'right' ? -20 : 20) + mastDir * 10);
+    ctx.stroke();
+
+    // Signal head (outline)
+    ctx.beginPath();
+    ctx.arc(x, y + (sig.direction === 'right' ? -22 : 22), r, 0, Math.PI * 2);
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // Signal light (outline only, colored)
+    ctx.beginPath();
+    ctx.arc(x, y + (sig.direction === 'right' ? -22 : 22), r - 3, 0, Math.PI * 2);
+    if (sig.state === 'red') {
+        ctx.strokeStyle = '#e74c3c';
+    } else {
+        ctx.strokeStyle = '#3498db';
+    }
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // Signal glow
+    ctx.beginPath();
+    ctx.arc(x, y + (sig.direction === 'right' ? -22 : 22), r + 4, 0, Math.PI * 2);
+    ctx.strokeStyle = sig.state === 'red'
+        ? 'rgba(231, 76, 60, 0.2)'
+        : 'rgba(52, 152, 219, 0.2)';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+
+    // Label
+    ctx.fillStyle = '#555';
+    ctx.font = '10px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText(sig.label, x, y + (sig.direction === 'right' ? -38 : 42));
+}
+
+function drawTrain(train) {
+    const x = train.x;
+    const y = train.y;
+
+    ctx.save();
+    ctx.translate(x, y);
+
+    // Draw each wagon (outline only)
+    for (let i = 0; i < WAGON_COUNT; i++) {
+        const wx = i * WAGON_LENGTH + 1;
+        const wy = -TRAIN_WIDTH / 2;
+        const ww = WAGON_LENGTH - 2;
+        const wh = TRAIN_WIDTH;
+
+        ctx.strokeStyle = '#1a5c1a';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.rect(wx, wy, ww, wh);
+        ctx.stroke();
+
+        // Wagon windows (small outline rectangles)
+        ctx.strokeStyle = '#2d8a2d';
+        ctx.lineWidth = 1;
+        const windowY = wy + 3;
+        const windowH = wh - 6;
+        for (let j = 0; j < 3; j++) {
+            const windowX = wx + 3 + j * (ww - 6) / 3;
+            const windowW = (ww - 10) / 3;
+            ctx.beginPath();
+            ctx.rect(windowX, windowY, windowW, windowH);
+            ctx.stroke();
+        }
+    }
+
+    // Coupler lines between wagons
+    ctx.strokeStyle = '#2a7a2a';
+    ctx.lineWidth = 1.5;
+    for (let i = 1; i < WAGON_COUNT; i++) {
+        const cx = i * WAGON_LENGTH;
+        ctx.beginPath();
+        ctx.moveTo(cx, -3);
+        ctx.lineTo(cx, 3);
+        ctx.stroke();
+    }
+
+    // Train number
+    ctx.fillStyle = '#1a5c1a';
+    ctx.font = 'bold 9px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText(`#${train.id}`, TRAIN_LENGTH / 2, 3);
+
+    ctx.restore();
+
+    // State indicator
+    let stateText = '';
+    if (train.state === TRAIN_STATES.AT_STATION_1) stateText = 'СТОЯНКА';
+    else if (train.state === TRAIN_STATES.WAITING_SIGNAL_1) stateText = 'ЖДЁТ СИГНАЛ';
+    else if (train.state === TRAIN_STATES.IN_SIDING) stateText = 'РАЗВОРОТ';
+    else if (train.state === TRAIN_STATES.WAITING_SIGNAL_SIDING) stateText = 'ЖДЁТ ВЫЕЗД';
+    else if (train.state === TRAIN_STATES.AT_STATION_2) stateText = 'ВЫСАДКА';
+
+    if (stateText) {
+        ctx.fillStyle = '#1a5c1a';
+        ctx.font = '10px Courier New';
+        ctx.textAlign = 'center';
+        ctx.fillText(stateText, x + TRAIN_LENGTH / 2, y - TRAIN_WIDTH / 2 - 8);
+    }
+}
+
+function drawBackground() {
+    ctx.fillStyle = BG_COLOR;
+    ctx.fillRect(0, 0, W, H);
+
+    // Subtle grid
+    ctx.strokeStyle = 'rgba(0,0,0,0.04)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += 50) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, H);
+        ctx.stroke();
+    }
+    for (let y = 0; y < H; y += 50) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+    }
+}
+
+function drawDirectionArrows() {
+    ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.lineWidth = 1;
+
+    // Arrow on Track 1 (right)
+    const ax1 = 70, ay1 = TRACK_1_Y;
+    ctx.beginPath();
+    ctx.moveTo(ax1 - 12, ay1 - 5);
+    ctx.lineTo(ax1, ay1);
+    ctx.lineTo(ax1 - 12, ay1 + 5);
+    ctx.stroke();
+
+    // Arrow on Track 2 (left)
+    const ax2 = 70, ay2 = TRACK_2_Y;
+    ctx.beginPath();
+    ctx.moveTo(ax2 + 12, ay2 - 5);
+    ctx.lineTo(ax2, ay2);
+    ctx.lineTo(ax2 + 12, ay2 + 5);
+    ctx.stroke();
+}
+
+function draw() {
+    drawBackground();
+    drawAllTracks();
+    drawPlatform();
+    drawDirectionArrows();
+
+    for (const key in signals) {
+        drawSignal(key);
+    }
+
+    for (const train of trains) {
+        if (train.state !== TRAIN_STATES.GONE) {
+            drawTrain(train);
+        }
+    }
+
+    // Title area
+    ctx.fillStyle = '#444';
+    ctx.font = '11px Courier New';
+    ctx.textAlign = 'right';
+    ctx.fillText('Оборотная станция метро', W - 15, H - 15);
+}
+
+function update(dt) {
+    elapsedTime += dt;
+
+    // Update clock
+    const minutes = Math.floor(elapsedTime / 60);
+    const seconds = Math.floor(elapsedTime % 60);
+    document.getElementById('clock').textContent =
+        String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+
+    // Spawn trains
+    nextTrainTimer -= dt;
+    document.getElementById('nextTrain').textContent = Math.max(0, Math.ceil(nextTrainTimer)) + 'с';
+    if (nextTrainTimer <= 0) {
+        const canSpawn = !trains.some(t =>
+            t.state === TRAIN_STATES.ARRIVING && t.x < STATION_LEFT
+        );
+        if (canSpawn) {
+            trains.push(createTrain());
+            addLog(`Новый поезд #${trainIdCounter} выехал на линию`);
+        }
+        nextTrainTimer = 80 + Math.random() * 20;
+    }
+
+    // Update trains
+    for (const train of trains) {
+        updateTrain(train, dt);
+    }
+
+    // Clean up gone trains
+    trains = trains.filter(t => t.state !== TRAIN_STATES.GONE);
+
+    // Update switch state display
+    document.getElementById('switchState').textContent =
+        crossoverState === 'parallel' ? 'ПРЯМО' : 'КРЕСТ';
+}
+
+function handleClick(e) {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (W / rect.width);
+    const my = (e.clientY - rect.top) * (H / rect.height);
+
+    // Check signal clicks
+    for (const key in signals) {
+        const sig = signals[key];
+        const sx = sig.x;
+        const sy = sig.y + (sig.direction === 'right' ? -22 : 22);
+        const dist = Math.sqrt((mx - sx) ** 2 + (my - sy) ** 2);
+        if (dist < SIGNAL_RADIUS + 8) {
+            sig.state = sig.state === 'red' ? 'blue' : 'red';
+            addLog(`Светофор ${sig.label}: ${sig.state === 'red' ? 'КРАСНЫЙ' : 'СИНИЙ'}`);
+            return;
+        }
+    }
+
+    // Check crossover/switch click
+    const cx = (CROSSOVER_LEFT + CROSSOVER_RIGHT) / 2;
+    const cy = (TRACK_1_Y + TRACK_2_Y) / 2;
+    const distCross = Math.sqrt((mx - cx) ** 2 + (my - cy) ** 2);
+    if (distCross < SWITCH_SIZE + 20) {
+        if (isCrossoverOccupied()) {
+            addLog('СТРЕЛКА ЗАБЛОКИРОВАНА — поезд в зоне стрелки!');
+            return;
+        }
+        crossoverState = crossoverState === 'parallel' ? 'crossed' : 'parallel';
+        addLog(`Стрелка переведена: ${crossoverState === 'parallel' ? 'ПРЯМО' : 'КРЕСТ'}`);
+        return;
+    }
+}
+
+canvas.addEventListener('click', handleClick);
+
+let lastTime = performance.now();
+
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.1);
+    lastTime = time;
+    update(dt);
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
