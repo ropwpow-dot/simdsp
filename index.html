@@ -34,6 +34,8 @@
             border: 1px solid rgba(80, 130, 80, 0.3);
         }
         #hud .v { color: #70e070; }
+        #hud .sr { color: #e74c3c; }
+        #hud .sb { color: #2eaadc; }
     </style>
 </head>
 <body>
@@ -42,6 +44,7 @@
         <div>Стрелка: <span class="v" id="hudSw">ПРЯМО</span></div>
         <div>Обработано: <span class="v" id="hudCnt">0</span></div>
         <div><span class="v" id="hudClk">00:00</span></div>
+        <div>Н1:<span class="sr" id="hsn1">●</span> О1:<span class="sr" id="hso1">●</span> О2:<span class="sr" id="hso2">●</span></div>
     </div>
     <script>
 'use strict';
@@ -216,6 +219,7 @@ let nxt = 6;
 let tid = 0;
 let trains = [];
 let aRoute = null;
+const sigFlash = {};
 
 const sigs = {
     n1:{x:0,y:0,st:'red',dir:'right',lb:'Н1',k:'n1'},
@@ -296,7 +300,7 @@ function updTrain(t,dt){
             t.pp=total;t.spd=0;t.st='ins';t.tmr=0;
             t.y=t.sid===1?L.T1:L.T2;
             t.x=L.BUF-10-L.TL/2;
-            sigs.n1.st='red';swLock=false;aRoute=null;
+            sigs.n1.st='red';swLock=false;aRoute=null;sigFlash.n1=1.0;updHudSigs();
         }
         break;
     }
@@ -311,7 +315,7 @@ function updTrain(t,dt){
             const rd=compExit(t.sid,sw);
             t.route=rd;t.pp=L.TL;t.spd=0;t.st='ert';t.dir=-1;
             t.dY=rd.et===1?L.T1:L.T2;
-            swLock=true;aRoute=rd;sg.st='red';
+            swLock=true;aRoute=rd;sg.st='red';sigFlash[t.sid===1?'o1':'o2']=1.0;updHudSigs();
         }
         break;
     }
@@ -572,6 +576,19 @@ function drawPlat(){
     ctx.beginPath();ctx.moveTo(pL,L.T2+gap);ctx.lineTo(pR,L.T2+gap);ctx.stroke();
     ctx.setLineDash([]);
 
+    const colW=Math.max(4,L.TGAP*0.04);
+    const colD=Math.max(6,L.TGAP*0.05);
+    const nCols=Math.max(3,Math.round((pR-pL)/80));
+    const colSp=(pR-pL-20)/(nCols-1);
+    for(let i=0;i<nCols;i++){
+        const cx2=pL+10+colSp*i;
+        ctx.fillStyle='#4a4a4a';
+        ctx.fillRect(cx2-colW/2,pT+4,colW,pH-8);
+        ctx.fillStyle='#555';
+        ctx.fillRect(cx2-colD/2,pT+2,colD,4);
+        ctx.fillRect(cx2-colD/2,pB-6,colD,4);
+    }
+
     ctx.fillStyle='#707070';
     ctx.font=`bold ${Math.max(10,L.TGAP*0.08)}px Courier New`;
     ctx.textAlign='center';ctx.textBaseline='middle';
@@ -606,6 +623,13 @@ function drawSig(s){
     g.addColorStop(0,s.st==='red'?'rgba(231,76,60,0.3)':'rgba(46,170,220,0.3)');
     g.addColorStop(1,'rgba(0,0,0,0)');
     ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,hy,r*3,0,Math.PI*2);ctx.fill();
+
+    const fl=sigFlash[s.k];
+    if(fl&&fl>0){
+        const fa=fl*0.8;
+        ctx.fillStyle=`rgba(255,255,255,${fa})`;
+        ctx.beginPath();ctx.arc(x,hy,r+4,0,Math.PI*2);ctx.fill();
+    }
 
     ctx.fillStyle='#708070';ctx.font=`${Math.max(8,r*0.8)}px Courier New`;
     ctx.textAlign='center';ctx.textBaseline='middle';
@@ -654,11 +678,14 @@ function drawWagon(cx,cy,ang,isH,isT){
 
     const sH=Math.max(1.5,ww*0.12);
     const sy1=-ww/2+1.5,sy2=ww/2-1.5;
-    ctx.fillStyle=C.TW;
     const sx=-wl/2+wl*0.08,ex=wl/2-wl*0.08;
     const nw2=6,sp=(ex-sx)/nw2;
     for(let i=0;i<nw2;i++){
         const wx=sx+sp*i+sp*0.2,wW=sp*0.5;
+        ctx.fillStyle='rgba(140,200,255,0.15)';
+        ctx.fillRect(wx-1,sy1-1,wW+2,sH+2);
+        ctx.fillRect(wx-1,sy2-sH-1,wW+2,sH+2);
+        ctx.fillStyle=C.TW;
         ctx.fillRect(wx,sy1,wW,sH);
         ctx.fillRect(wx,sy2-sH,wW,sH);
     }
@@ -692,8 +719,29 @@ function drawCpl(a,b){
     ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
 }
 
+function drawHeadlight(p,spd){
+    if(spd<5)return;
+    const alpha=Math.min(0.25,spd/400);
+    const len=Math.max(40,L.WL*1.5);
+    const spread=L.WW*1.2;
+    ctx.save();ctx.translate(p.x,p.y);ctx.rotate(p.a);
+    const g=ctx.createRadialGradient(L.WL/2,0,2,L.WL/2+len*0.6,0,len);
+    g.addColorStop(0,`rgba(255,240,200,${alpha})`);
+    g.addColorStop(0.5,`rgba(255,230,180,${alpha*0.4})`);
+    g.addColorStop(1,'rgba(255,220,160,0)');
+    ctx.fillStyle=g;
+    ctx.beginPath();
+    ctx.moveTo(L.WL/2,-L.WW*0.3);
+    ctx.lineTo(L.WL/2+len,-spread);
+    ctx.lineTo(L.WL/2+len,spread);
+    ctx.lineTo(L.WL/2,L.WW*0.3);
+    ctx.closePath();ctx.fill();
+    ctx.restore();
+}
+
 function drawTrain(t){
     const pos=wagonPos(t);
+    if(t.spd>5&&pos.length>0)drawHeadlight(pos[0],t.spd);
     for(let i=0;i<pos.length-1;i++){
         const a=pos[i],b=pos[i+1];
         drawCpl(
@@ -721,6 +769,12 @@ function drawTrain(t){
         ctx.textAlign='center';ctx.textBaseline='bottom';
         ctx.fillText(st,t.x,t.y-L.WW/2-6);
     }
+    if(t.spd>2){
+        ctx.fillStyle='rgba(200,220,200,0.5)';
+        ctx.font=`${Math.max(7,L.WW*0.4)}px Courier New`;
+        ctx.textAlign='center';ctx.textBaseline='top';
+        ctx.fillText(`${Math.round(t.spd)} км/ч`,pos[0].x,pos[0].y+L.WW/2+3);
+    }
 }
 
 /* ═══════════ ROUTE HIGHLIGHT ═══════════ */
@@ -745,6 +799,15 @@ function drawBg(){
     const bw=L.GA*5;
     ctx.fillRect(0,L.T1-bw,W,bw*2);
     ctx.fillRect(0,L.T2-bw,W,bw*2);
+
+    ctx.strokeStyle='rgba(40,40,40,0.25)';ctx.lineWidth=0.5;
+    for(const ty of[L.T1,L.T2]){
+        for(let x=0;x<W;x+=7){
+            const h=((x*137+31)%17)/17;
+            const y1=ty-bw+h*bw*2;
+            ctx.beginPath();ctx.moveTo(x,y1);ctx.lineTo(x+3,y1+1.5);ctx.stroke();
+        }
+    }
 }
 
 /* ═══════════ DIRECTION ARROWS ═══════════ */
@@ -766,6 +829,7 @@ function onClick(e){
         const hy=s.y+ab*(L.GA*2.5+L.SR);
         const d=Math.sqrt((mx-s.x)**2+(my-hy)**2);
         if(d<L.SR+12){
+            const prev=s.st;
             if(s.st==='red'){
                 if(k==='n1'){
                     const tgt=sw==='parallel'?1:2;
@@ -777,6 +841,8 @@ function onClick(e){
             } else {
                 s.st='red';
             }
+            if(prev!==s.st)sigFlash[k]=1.0;
+            updHudSigs();
             return;
         }
     }
@@ -792,8 +858,22 @@ function onClick(e){
 }
 canvas.addEventListener('click',onClick);
 
+/* ═══════════ HUD SIGNALS ═══════════ */
+function updHudSigs(){
+    for(const k of['n1','o1','o2']){
+        const el=document.getElementById('hs'+k);
+        if(el){
+            el.textContent='●';
+            el.className=sigs[k].st==='red'?'sr':'sb';
+        }
+    }
+}
+
 /* ═══════════ GAME LOOP ═══════════ */
 function update(dt){
+    for(const k in sigFlash){
+        if(sigFlash[k]>0){sigFlash[k]-=dt*3;if(sigFlash[k]<0)sigFlash[k]=0;}
+    }
     et+=dt;
     const m=Math.floor(et/60),s=Math.floor(et%60);
     document.getElementById('hudClk').textContent=String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
